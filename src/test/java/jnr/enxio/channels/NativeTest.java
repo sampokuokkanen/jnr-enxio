@@ -12,6 +12,8 @@ import java.io.FileOutputStream;
 import java.lang.reflect.Field;
 import java.nio.channels.Pipe;
 import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class NativeTest {
     @Rule
@@ -128,11 +130,69 @@ public class NativeTest {
     }
 
     @Test
+    public void pollKeepsConcurrentCallersApart() throws Exception {
+        Assume.assumeTrue(Native.isPollSupported());
+
+        // twice as many threads as slots, so slots are shared: each must still see only its own descriptor's events
+        int threads = 2 * Native.POLLFDS_SLOTS;
+        final CountDownLatch start = new CountDownLatch(1);
+        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        // half the threads poll a readable pipe and half an empty one, however many threads there are
+        int[][] pipes = new int[2][];
+        Thread[] workers = new Thread[threads];
+        try {
+            pipes[0] = pipe();
+            pipes[1] = pipe();
+            Assert.assertEquals(1, Native.libc().write(pipes[0][1], new byte[] { 1 }, 1));
+
+            // no timeout to trip on a slow host, and released even if starting a thread fails
+            try {
+                for (int t = 0; t < threads; t++) {
+                    final boolean readable = t % 2 == 0;
+                    final int[] fds = { pipes[t % 2][0] };
+                    workers[t] = new Thread(new Runnable() {
+                        public void run() {
+                            try {
+                                short[] events = { Native.POLLIN };
+                                short[] revents = new short[1];
+                                short expected = readable ? Native.POLLIN : 0;
+
+                                start.await();
+                                for (int i = 0; i < 10000; i++) {
+                                    Assert.assertEquals(readable ? 1 : 0, Native.poll(fds, events, revents, 0));
+                                    Assert.assertEquals(expected, revents[0]);
+                                }
+                            } catch (Throwable e) {
+                                failure.compareAndSet(null, e);
+                            }
+                        }
+                    });
+                    workers[t].start();
+                }
+            } finally {
+                start.countDown();
+            }
+            for (Thread worker : workers) if (worker != null) worker.join();
+        } finally {
+            for (int[] pipe : pipes) if (pipe != null) close(pipe);
+        }
+        if (failure.get() != null) throw new AssertionError(failure.get());
+    }
+
+    @Test
     public void pollRejectsShortEventArrays() {
         Assume.assumeTrue(Native.isPollSupported());
 
         expectedEx.expect(IllegalArgumentException.class);
         Native.poll(new int[2], new short[1], new short[2], 0);
+    }
+
+    @Test
+    public void pollRejectsShortReventArrays() {
+        Assume.assumeTrue(Native.isPollSupported());
+
+        expectedEx.expect(IllegalArgumentException.class);
+        Native.poll(new int[2], new short[2], new short[1], 0);
     }
 
     private static int[] pipe() {

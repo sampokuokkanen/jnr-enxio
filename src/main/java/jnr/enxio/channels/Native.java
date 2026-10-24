@@ -36,6 +36,7 @@ import jnr.ffi.types.u_int64_t;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 public final class Native {
 
@@ -170,7 +171,7 @@ public final class Native {
         return libc().shutdown(fd, how);
     }
 
-    // <poll.h> on the systems isPollSupported accepts
+    // <poll.h> on Linux, macOS, the BSDs and Solaris; poll only runs where isPollSupported says these are right
     public static final short POLLIN = 0x1;
     public static final short POLLOUT = 0x4;
     public static final short POLLERR = 0x8;
@@ -183,8 +184,15 @@ public final class Native {
     static final int EVENTS_OFFSET = 4;
     static final int REVENTS_OFFSET = 6;
 
-    // allocating direct memory costs more than a zero-timeout poll, so keep a buffer per thread
-    private static final ThreadLocal<ByteBuffer> POLLFDS = new ThreadLocal<ByteBuffer>();
+    // Allocating a buffer costs more than a zero-timeout poll, so buffers are reused. Each caller takes the buffer from
+    // its thread's slot and puts it back afterwards, so no two callers share one, whether threads, virtual threads or
+    // fibers; an empty slot just means allocating a fresh one. Slots are a cache line apart, and a buffer pushed out
+    // of its slot is freed by its cleaner.
+    // the smallest power of two at least twice the CPU count, so a mask picks the slot
+    static final int POLLFDS_SLOTS = Integer.highestOneBit(java.lang.Runtime.getRuntime().availableProcessors() * 2 - 1) << 1;
+    private static final int POLLFDS_SPACING = 32; // compressed references per 128-byte cache line, as on Apple silicon
+    private static final AtomicReferenceArray<Pointer> POLLFDS =
+            new AtomicReferenceArray<Pointer>((POLLFDS_SLOTS + 1) * POLLFDS_SPACING);
 
     private static final boolean POLL_SUPPORTED = pollSupported();
 
@@ -195,29 +203,17 @@ public final class Native {
         return platform.isBSD() || os == OS.LINUX || os == OS.ZLINUX || os == OS.SOLARIS;
     }
 
-    /**
-     * Whether {@link #poll(int[], short[], short[], int)} and the POLL* values above can be used here.
-     */
+    /** Whether {@link #poll} and the POLL* constants can be used on this platform. */
     public static boolean isPollSupported() {
         return POLL_SUPPORTED;
     }
 
     /**
-     * poll(2) over plain descriptors, without registering any channel with a selector.
-     *
-     * A descriptor should appear only once: macOS reports one given twice in only one of its entries.
-     *
-     * Unlike {@link #read(int, ByteBuffer)}, an interrupted call is not retried, since only the caller knows how
-     * much of its timeout is left. A negative timeout blocks in native code, where {@link Thread#interrupt()}
-     * cannot wake it.
-     *
-     * @param fds the descriptors
-     * @param events what to wait for on each descriptor, POLLIN and/or POLLOUT
-     * @param revents receives what poll(2) reported for each descriptor, left as it was when poll(2) fails
-     * @param timeout milliseconds to wait, 0 to return at once, negative to wait forever
-     * @return the number of descriptors with events, 0 on timeout, or -1 with the error, EINTR among them,
-     *         in {@link #getLastError()}
-     * @throws UnsupportedOperationException if {@link #isPollSupported()} is false
+     * poll(2) over plain descriptors, without a selector: fills {@code revents} and returns what poll(2) returns, with
+     * the error in {@link #getLastError()} on -1. EINTR isn't retried, since only the caller knows how much of its
+     * timeout is left. List a descriptor only once (macOS reports a duplicate in only one entry), and prefer a zero
+     * timeout: any other blocks in native code, where interrupts can't reach it and a virtual thread pins its carrier.
+     * Only call this where {@link #isPollSupported()} is true.
      */
     public static int poll(int[] fds, short[] events, short[] revents, int timeout) {
         if (!POLL_SUPPORTED) {
@@ -229,30 +225,30 @@ public final class Native {
             throw new IllegalArgumentException("events and revents need an entry for every descriptor");
         }
 
-        ByteBuffer pollfds = pollfds(nfds);
-        pollfds.clear();
-        for (int i = 0; i < nfds; i++) {
-            pollfds.putInt(fds[i]).putShort(events[i]).putShort((short) 0);
+        // skip the cache line holding the array header, which every access reads, then one slot per line
+        int slot = (((int) Thread.currentThread().getId() & (POLLFDS_SLOTS - 1)) + 1) * POLLFDS_SPACING;
+        Pointer pollfds = POLLFDS.getAndSet(slot, null);
+        if (pollfds == null || pollfds.size() < (long) nfds * POLLFD_SIZE) {
+            ByteBuffer buffer = ByteBuffer.allocateDirect(Math.max(nfds, 8) * POLLFD_SIZE).order(ByteOrder.nativeOrder());
+            pollfds = Pointer.wrap(getRuntime(), buffer);
         }
-        pollfds.flip(); // the buffer is passed from its position
+
+        for (int i = 0; i < nfds; i++) {
+            long pollfd = (long) i * POLLFD_SIZE;
+            pollfds.putInt(pollfd + FD_OFFSET, fds[i]);
+            pollfds.putShort(pollfd + EVENTS_OFFSET, events[i]);
+            pollfds.putShort(pollfd + REVENTS_OFFSET, (short) 0);
+        }
 
         int n = libc().poll(pollfds, nfds, timeout);
-        if (n < 0) return n;
-
-        for (int i = 0; i < nfds; i++) {
-            revents[i] = pollfds.getShort(i * POLLFD_SIZE + REVENTS_OFFSET);
+        if (n >= 0) {
+            for (int i = 0; i < nfds; i++) {
+                revents[i] = pollfds.getShort((long) i * POLLFD_SIZE + REVENTS_OFFSET);
+            }
         }
 
+        POLLFDS.lazySet(slot, pollfds);
         return n;
-    }
-
-    private static ByteBuffer pollfds(int nfds) {
-        ByteBuffer pollfds = POLLFDS.get();
-        if (pollfds == null || pollfds.capacity() < nfds * POLLFD_SIZE) {
-            pollfds = ByteBuffer.allocateDirect(Math.max(nfds, 8) * POLLFD_SIZE).order(ByteOrder.nativeOrder());
-            POLLFDS.set(pollfds);
-        }
-        return pollfds;
     }
 
     public static String getLastErrorString() {
