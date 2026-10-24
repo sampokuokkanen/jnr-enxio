@@ -35,6 +35,7 @@ import jnr.ffi.types.u_int64_t;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 public final class Native {
 
@@ -167,6 +168,91 @@ public final class Native {
     
     public static int shutdown(int fd, int how) {
         return libc().shutdown(fd, how);
+    }
+
+    // <poll.h> on the systems isPollSupported accepts
+    public static final short POLLIN = 0x1;
+    public static final short POLLOUT = 0x4;
+    public static final short POLLERR = 0x8;
+    public static final short POLLHUP = 0x10;
+    public static final short POLLNVAL = 0x20;
+
+    // struct pollfd { int fd; short events; short revents; }
+    static final int POLLFD_SIZE = 8;
+    static final int FD_OFFSET = 0;
+    static final int EVENTS_OFFSET = 4;
+    static final int REVENTS_OFFSET = 6;
+
+    // allocating direct memory costs more than a zero-timeout poll, so keep a buffer per thread
+    private static final ThreadLocal<ByteBuffer> POLLFDS = new ThreadLocal<ByteBuffer>();
+
+    private static final boolean POLL_SUPPORTED = pollSupported();
+
+    // AIX, for one, has other values, and Windows has no poll(2)
+    private static boolean pollSupported() {
+        Platform platform = Platform.getNativePlatform();
+        OS os = platform.getOS();
+        return platform.isBSD() || os == OS.LINUX || os == OS.ZLINUX || os == OS.SOLARIS;
+    }
+
+    /**
+     * Whether {@link #poll(int[], short[], short[], int)} and the POLL* values above can be used here.
+     */
+    public static boolean isPollSupported() {
+        return POLL_SUPPORTED;
+    }
+
+    /**
+     * poll(2) over plain descriptors, without registering any channel with a selector.
+     *
+     * A descriptor should appear only once: macOS reports one given twice in only one of its entries.
+     *
+     * Unlike {@link #read(int, ByteBuffer)}, an interrupted call is not retried, since only the caller knows how
+     * much of its timeout is left. A negative timeout blocks in native code, where {@link Thread#interrupt()}
+     * cannot wake it.
+     *
+     * @param fds the descriptors
+     * @param events what to wait for on each descriptor, POLLIN and/or POLLOUT
+     * @param revents receives what poll(2) reported for each descriptor, left as it was when poll(2) fails
+     * @param timeout milliseconds to wait, 0 to return at once, negative to wait forever
+     * @return the number of descriptors with events, 0 on timeout, or -1 with the error, EINTR among them,
+     *         in {@link #getLastError()}
+     * @throws UnsupportedOperationException if {@link #isPollSupported()} is false
+     */
+    public static int poll(int[] fds, short[] events, short[] revents, int timeout) {
+        if (!POLL_SUPPORTED) {
+            throw new UnsupportedOperationException("poll isn't supported on " + Platform.getNativePlatform().getOS());
+        }
+
+        int nfds = fds.length;
+        if (events.length < nfds || revents.length < nfds) {
+            throw new IllegalArgumentException("events and revents need an entry for every descriptor");
+        }
+
+        ByteBuffer pollfds = pollfds(nfds);
+        pollfds.clear();
+        for (int i = 0; i < nfds; i++) {
+            pollfds.putInt(fds[i]).putShort(events[i]).putShort((short) 0);
+        }
+        pollfds.flip(); // the buffer is passed from its position
+
+        int n = libc().poll(pollfds, nfds, timeout);
+        if (n < 0) return n;
+
+        for (int i = 0; i < nfds; i++) {
+            revents[i] = pollfds.getShort(i * POLLFD_SIZE + REVENTS_OFFSET);
+        }
+
+        return n;
+    }
+
+    private static ByteBuffer pollfds(int nfds) {
+        ByteBuffer pollfds = POLLFDS.get();
+        if (pollfds == null || pollfds.capacity() < nfds * POLLFD_SIZE) {
+            pollfds = ByteBuffer.allocateDirect(Math.max(nfds, 8) * POLLFD_SIZE).order(ByteOrder.nativeOrder());
+            POLLFDS.set(pollfds);
+        }
+        return pollfds;
     }
 
     public static String getLastErrorString() {
