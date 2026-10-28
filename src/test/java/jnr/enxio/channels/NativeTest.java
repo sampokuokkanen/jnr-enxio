@@ -8,8 +8,11 @@ import org.junit.rules.ExpectedException;
 
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
+import java.io.RandomAccessFile;
 import java.lang.reflect.Field;
 import java.nio.channels.Pipe;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 
 public class NativeTest {
     @Rule
@@ -47,5 +50,32 @@ public class NativeTest {
         Assert.assertEquals(true, Native.getBlocking(fd));
         Native.setBlocking(fd, false);
         Assert.assertEquals(false, Native.getBlocking(fd));
+    }
+
+    @Test
+    public void pollSelectorReportsDeviceReady() throws Exception {
+        // Skip on non-unix
+        if (!Platform.getNativePlatform().isUnix()) return;
+
+        RandomAccessFile file = new RandomAccessFile("/dev/null", "rw");
+        try {
+            FileDescriptor descriptor = file.getFD();
+            Field fdField = descriptor.getClass().getDeclaredField("fd");
+            fdField.setAccessible(true);
+            int fd = (int)(Integer)fdField.get(descriptor);
+
+            NativeDeviceChannel channel = new NativeDeviceChannel(fd, true);
+            channel.configureBlocking(false);
+            Selector selector = channel.provider().openSelector();
+            try {
+                SelectionKey key = channel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+                Assert.assertEquals(1, selector.selectNow());
+                Assert.assertEquals(SelectionKey.OP_READ | SelectionKey.OP_WRITE, key.readyOps());
+            } finally {
+                selector.close();
+            }
+        } finally {
+            file.close();
+        }
     }
 }
